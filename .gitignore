@@ -1,0 +1,9 @@
+node_modules
+.next
+out
+.env
+.env.local
+.DS_Store
+playwright-report
+test-results
+public/audio/interview.wav

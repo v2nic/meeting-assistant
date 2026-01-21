@@ -1,0 +1,51 @@
+.card {
+  background: #fffdfb;
+  border: 1px solid #e6ded5;
+  border-radius: 18px;
+  box-shadow: 0 12px 30px rgba(19, 17, 12, 0.08);
+  padding: 24px;
+  display: grid;
+  gap: 16px;
+}
+
+.controls {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.button {
+  background: #1f1d1a;
+  color: #fff;
+  border: none;
+  border-radius: 999px;
+  padding: 10px 16px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.buttonSecondary {
+  background: #f0e7dc;
+  color: #1f1d1a;
+}
+
+.transcript {
+  min-height: 200px;
+  border: 1px solid #eaded2;
+  border-radius: 14px;
+  padding: 12px;
+  background: #fff;
+  display: grid;
+  gap: 12px;
+}
+
+.entry {
+  border-bottom: 1px dashed #eee0d2;
+  padding-bottom: 8px;
+}
+
+.meta {
+  font-size: 0.8rem;
+  color: #7e7264;
+  margin-bottom: 4px;
+}
