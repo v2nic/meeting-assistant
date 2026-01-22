@@ -1,12 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { classifyTopic } from "@/lib/llm";
+import { classifyTopic, isBrowserModelAvailable } from "@/lib/llm";
 import {
   startAudioElementTranscription,
   startMicrophoneTranscription,
 } from "@/lib/vosk";
-import type { AgendaTopic, ClassificationResult } from "@/lib/types";
+import type {
+  AgendaTopic,
+  ClassifiedTopic,
+  ClassificationSource,
+} from "@/lib/types";
 import styles from "./MeetingAssistant.module.css";
 
 type TranscriptEntry = {
@@ -27,11 +31,24 @@ type TranscriptionSession = {
   stop: () => void;
 };
 
+const logBrowserEvent = (event: string, payload: Record<string, unknown>) => {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  console.log("[meeting-assistant]", {
+    event,
+    timestamp: new Date().toISOString(),
+    ...payload,
+  });
+};
+
 const MODEL_URL =
   "https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz";
 const DEMO_AUDIO = "/audio/interview.wav";
 const MAX_WORDS = 200;
 const RECENT_WINDOW_MS = 2 * 60 * 1000;
+const AUTO_TOPIC_CONFIDENCE = 0.8;
 
 const defaultAgenda: AgendaTopic[] = [
   {
@@ -140,20 +157,31 @@ export default function MeetingAssistant() {
   );
   const [partialTranscript, setPartialTranscript] = useState("");
   const [transcriptionStatus, setTranscriptionStatus] = useState("idle");
-  const [classification, setClassification] =
-    useState<ClassificationResult | null>(null);
+  const [classification, setClassification] = useState<ClassifiedTopic | null>(
+    null,
+  );
   const [classificationPending, setClassificationPending] = useState(false);
   const [classificationError, setClassificationError] = useState<string | null>(
     null,
   );
+  const [classificationSource, setClassificationSource] =
+    useState<ClassificationSource | null>(null);
   const [audioSource, setAudioSource] = useState<AudioSource>("microphone");
+
+  const classificationSourceLabel = classificationSource
+    ? classificationSource === "browser"
+      ? "Browser LLM"
+      : "Ollama"
+    : null;
 
   const sessionRef = useRef<TranscriptionSession | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const classifyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transcriptRef = useRef<TranscriptEntry[]>([]);
-  const classificationRef = useRef<ClassificationResult | null>(null);
+  const classificationRef = useRef<ClassifiedTopic | null>(null);
   const classificationPendingRef = useRef(false);
+  const queuedClassificationRef = useRef<TranscriptEntry[] | null>(null);
+  const chimeTopicRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!meetingRunning) {
@@ -186,20 +214,58 @@ export default function MeetingAssistant() {
     if (!classificationRef.current) {
       const transcriptSlice = buildTranscriptSlice(transcriptEntries);
       if (transcriptSlice) {
-        setClassification(
-          heuristicClassify(transcriptSlice, agenda, doneTopicIds),
-        );
+        setClassification({
+          result: heuristicClassify(transcriptSlice, agenda, doneTopicIds),
+          source: "browser",
+        });
       }
     }
   }, [agenda, doneTopicIds, meetingRunning, transcriptEntries]);
 
   useEffect(() => {
     classificationRef.current = classification;
+    setClassificationSource(classification?.source ?? null);
   }, [classification]);
 
   useEffect(() => {
     classificationPendingRef.current = classificationPending;
   }, [classificationPending]);
+
+  const playTimerChime = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const AudioContextConstructor =
+      window.AudioContext ||
+      (window as Window & { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+
+    if (!AudioContextConstructor) {
+      return;
+    }
+
+    const context = new AudioContextConstructor();
+    const now = context.currentTime;
+    const gain = context.createGain();
+
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.25, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 1.1);
+    gain.connect(context.destination);
+
+    const oscillator = context.createOscillator();
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(880, now);
+    oscillator.frequency.exponentialRampToValueAtTime(659, now + 0.6);
+    oscillator.connect(gain);
+    oscillator.start(now);
+    oscillator.stop(now + 1.1);
+
+    window.setTimeout(() => {
+      void context.close();
+    }, 1300);
+  }, []);
 
   const resetAgenda = useCallback(() => {
     setAgenda((prev) => prev.map((topic) => ({ ...topic, done: false })));
@@ -218,66 +284,46 @@ export default function MeetingAssistant() {
         allocatedSeconds: allocated,
         startingOvertimeSeconds: startingOvertime,
       });
+      chimeTopicRef.current = null;
+
+      logBrowserEvent("topic_started", {
+        topicId: topic.id,
+        title: topic.title,
+        allocatedSeconds: allocated,
+        carryOverSeconds,
+      });
     },
     [agenda],
   );
+
+  useEffect(() => {
+    if (!meetingRunning || !currentTopic || !topicTiming) {
+      return;
+    }
+
+    if (timing.remainingSeconds > 0) {
+      return;
+    }
+
+    if (chimeTopicRef.current === currentTopic.id) {
+      return;
+    }
+
+    chimeTopicRef.current = currentTopic.id;
+    playTimerChime();
+  }, [
+    currentTopic,
+    meetingRunning,
+    playTimerChime,
+    timing.remainingSeconds,
+    topicTiming,
+  ]);
 
   const stopTranscription = useCallback(() => {
     sessionRef.current?.stop();
     sessionRef.current = null;
     setPartialTranscript("");
   }, []);
-
-  const startTranscription = useCallback(async () => {
-    stopTranscription();
-
-    const callbacks = {
-      onFinal: (text: string, timestamp: number) => {
-        setTranscriptEntries((prev) => [
-          ...prev,
-          { id: `${timestamp}-${prev.length}`, text, timestamp },
-        ]);
-        setPartialTranscript("");
-      },
-      onPartial: (text: string) => setPartialTranscript(text),
-      onStatus: (status: string) => setTranscriptionStatus(status),
-      onError: (error: Error) =>
-        setTranscriptionStatus(`error: ${error.message}`),
-    };
-
-    if (audioSource === "demo") {
-      if (!audioRef.current) {
-        return;
-      }
-
-      sessionRef.current = await startAudioElementTranscription(
-        MODEL_URL,
-        audioRef.current,
-        callbacks,
-      );
-      return;
-    }
-
-    sessionRef.current = await startMicrophoneTranscription(
-      MODEL_URL,
-      callbacks,
-    );
-  }, [audioSource, stopTranscription]);
-
-  const handleStartMeeting = useCallback(async () => {
-    resetAgenda();
-    setTranscriptEntries([]);
-    setClassification(null);
-    setClassificationError(null);
-    setMeetingRunning(true);
-    startTopic(0, 0);
-    await startTranscription();
-  }, [resetAgenda, startTopic, startTranscription]);
-
-  const handleStopMeeting = useCallback(() => {
-    setMeetingRunning(false);
-    stopTranscription();
-  }, [stopTranscription]);
 
   const advanceToTopic = useCallback(
     (index: number) => {
@@ -312,28 +358,31 @@ export default function MeetingAssistant() {
     }
   }, [advanceToTopic, agenda.length, currentTopicIndex]);
 
-  useEffect(() => {
-    if (!meetingRunning) {
-      return;
-    }
-
-    const interval = setInterval(async () => {
-      if (classificationPendingRef.current) {
+  const runClassification = useCallback(
+    async (entries: TranscriptEntry[]) => {
+      if (!meetingRunning) {
         return;
       }
 
-      const transcriptSlice = buildTranscriptSlice(transcriptRef.current);
+      if (classificationPendingRef.current) {
+        queuedClassificationRef.current = entries;
+        return;
+      }
+
+      const transcriptSlice = buildTranscriptSlice(entries);
       if (!transcriptSlice) {
         return;
       }
 
       if (!classificationRef.current) {
-        setClassification(
-          heuristicClassify(transcriptSlice, agenda, doneTopicIds),
-        );
+        setClassification({
+          result: heuristicClassify(transcriptSlice, agenda, doneTopicIds),
+          source: "browser",
+        });
       }
 
       setClassificationPending(true);
+      classificationPendingRef.current = true;
       setClassificationError(null);
 
       try {
@@ -345,9 +394,10 @@ export default function MeetingAssistant() {
         setClassification(result);
 
         const nextIndex = agenda.findIndex(
-          (topic) => topic.id === result.topicId,
+          (topic) => topic.id === result.result.topicId,
         );
         if (
+          result.result.confidence >= AUTO_TOPIC_CONFIDENCE &&
           nextIndex >= 0 &&
           nextIndex !== currentTopicIndex &&
           !agenda[nextIndex].done
@@ -360,13 +410,91 @@ export default function MeetingAssistant() {
         );
       } finally {
         setClassificationPending(false);
+        classificationPendingRef.current = false;
+        const queuedEntries = queuedClassificationRef.current;
+        if (queuedEntries) {
+          queuedClassificationRef.current = null;
+          void runClassification(queuedEntries);
+        }
       }
-    }, 2000);
+    },
+    [agenda, advanceToTopic, currentTopicIndex, doneTopicIds, meetingRunning],
+  );
 
-    return () => {
-      clearInterval(interval);
+  const startTranscription = useCallback(async () => {
+    stopTranscription();
+
+    const callbacks = {
+      onFinal: (text: string, timestamp: number) => {
+        setTranscriptEntries((prev) => {
+          const next = [
+            ...prev,
+            { id: `${timestamp}-${prev.length}`, text, timestamp },
+          ];
+          void runClassification(next);
+          return next;
+        });
+        setPartialTranscript("");
+      },
+      onPartial: (text: string) => setPartialTranscript(text),
+      onStatus: (status: string) => {
+        setTranscriptionStatus(status);
+        logBrowserEvent("transcription_status", {
+          status,
+          source: audioSource,
+        });
+      },
+      onError: (error: Error) => {
+        setTranscriptionStatus(`error: ${error.message}`);
+        logBrowserEvent("transcription_error", {
+          message: error.message,
+          source: audioSource,
+        });
+      },
     };
-  }, [advanceToTopic, agenda, currentTopicIndex, doneTopicIds, meetingRunning]);
+
+    if (audioSource === "demo") {
+      if (!audioRef.current) {
+        return;
+      }
+
+      sessionRef.current = await startAudioElementTranscription(
+        MODEL_URL,
+        audioRef.current,
+        callbacks,
+      );
+      return;
+    }
+
+    sessionRef.current = await startMicrophoneTranscription(
+      MODEL_URL,
+      callbacks,
+    );
+  }, [audioSource, runClassification, stopTranscription]);
+
+  const handleStartMeeting = useCallback(async () => {
+    resetAgenda();
+    setTranscriptEntries([]);
+    setClassification(null);
+    setClassificationError(null);
+    setMeetingRunning(true);
+
+    logBrowserEvent("meeting_started", {
+      agendaCount: agenda.length,
+      audioSource,
+    });
+    startTopic(0, 0);
+    await startTranscription();
+  }, [agenda.length, audioSource, resetAgenda, startTopic, startTranscription]);
+
+  const handleStopMeeting = useCallback(() => {
+    setMeetingRunning(false);
+    stopTranscription();
+
+    logBrowserEvent("meeting_stopped", {
+      transcriptEntries: transcriptRef.current.length,
+    });
+  }, [stopTranscription]);
 
   const handleAgendaChange = useCallback(
     (index: number, field: "title" | "minutes", value: string) => {
@@ -411,7 +539,12 @@ export default function MeetingAssistant() {
               transcript.
             </p>
           </div>
-          <span className={styles.badge}>Model: Vosk + Ollama</span>
+          <span className={styles.badge} data-testid="model-status">
+            Model: Vosk • {isBrowserModelAvailable() ? "Browser LLM" : "Ollama"}
+            {classificationSourceLabel
+              ? ` • Using ${classificationSourceLabel}`
+              : ""}
+          </span>
         </div>
 
         <div className={styles.controls}>
@@ -483,11 +616,11 @@ export default function MeetingAssistant() {
                 className={styles.agendaTitle}
                 data-testid="classification-topic"
               >
-                {classification.topicId}
+                {classification.result.topicId}
               </div>
               <div className={styles.agendaMeta}>
-                Confidence {Math.round(classification.confidence * 100)}% —{" "}
-                {classification.reasoning}
+                Confidence {Math.round(classification.result.confidence * 100)}%
+                — {classification.result.reasoning}
               </div>
             </div>
           )}

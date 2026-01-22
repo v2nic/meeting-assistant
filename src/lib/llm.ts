@@ -1,4 +1,9 @@
-import type { AgendaTopic, ClassificationResult } from "./types";
+import type {
+  AgendaTopic,
+  ClassificationResult,
+  ClassificationSource,
+  ClassifiedTopic,
+} from "./types";
 
 export type ClassificationInput = {
   transcript: string;
@@ -20,6 +25,23 @@ type BrowserLanguageModelApi = {
 
 const systemPrompt =
   "You classify meeting transcripts into agenda topics. Return strict JSON with topicId, confidence (0-1), and reasoning.";
+
+const logBrowserEvent = (event: string, payload: Record<string, unknown>) => {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  console.log("[meeting-assistant]", {
+    event,
+    timestamp: new Date().toISOString(),
+    ...payload,
+  });
+};
+
+export const isBrowserModelAvailable = () => {
+  const ai = (globalThis as { ai?: BrowserLanguageModelApi }).ai;
+  return Boolean(ai?.languageModel?.create);
+};
 
 const buildPrompt = (input: ClassificationInput) => {
   const agendaText = input.agenda
@@ -55,9 +77,21 @@ const tryLocalClassification = async (
     return null;
   }
 
+  const prompt = buildPrompt(input);
+  logBrowserEvent("llm_input", {
+    source: "browser",
+    system: systemPrompt,
+    prompt,
+    input,
+  });
+
   const model = await ai.languageModel.create({ system: systemPrompt });
-  const result = await model.generate({ prompt: buildPrompt(input) });
+  const result = await model.generate({ prompt });
   const text = typeof result === "string" ? result : (result.response ?? "");
+  logBrowserEvent("llm_output", {
+    source: "browser",
+    raw: text,
+  });
   const parsed = safeJsonParse(text);
   if (!parsed) {
     return null;
@@ -68,11 +102,16 @@ const tryLocalClassification = async (
 
 export const classifyTopic = async (
   input: ClassificationInput,
-): Promise<ClassificationResult> => {
+): Promise<ClassifiedTopic> => {
   const localResult = await tryLocalClassification(input);
   if (localResult) {
-    return localResult;
+    return { result: localResult, source: "browser" };
   }
+
+  logBrowserEvent("llm_input", {
+    source: "ollama",
+    input,
+  });
 
   const response = await fetch("/api/classify", {
     method: "POST",
@@ -84,5 +123,14 @@ export const classifyTopic = async (
     throw new Error("Classification failed");
   }
 
-  return (await response.json()) as ClassificationResult;
+  const result = (await response.json()) as ClassificationResult;
+  logBrowserEvent("llm_output", {
+    source: "ollama",
+    result,
+  });
+
+  return {
+    result,
+    source: "ollama" satisfies ClassificationSource,
+  };
 };

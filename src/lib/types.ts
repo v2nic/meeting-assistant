@@ -10,3 +10,10 @@ export type ClassificationResult = {
   confidence: number;
   reasoning: string;
 };
+
+export type ClassificationSource = "browser" | "ollama";
+
+export type ClassifiedTopic = {
+  result: ClassificationResult;
+  source: ClassificationSource;
+};
