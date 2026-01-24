@@ -7,7 +7,9 @@ import {
   startMicrophoneTranscription,
 } from "@/lib/vosk";
 import type {
+  AgendaDefinition,
   AgendaTopic,
+  AgendaTopicInput,
   ClassifiedTopic,
   ClassificationSource,
 } from "@/lib/types";
@@ -23,6 +25,7 @@ type TopicTiming = {
   startMs: number;
   allocatedSeconds: number;
   startingOvertimeSeconds: number;
+  totalAllocatedSeconds: number;
 };
 
 type AudioSource = "microphone" | "demo";
@@ -50,21 +53,41 @@ const MAX_WORDS = 200;
 const RECENT_WINDOW_MS = 2 * 60 * 1000;
 const AUTO_TOPIC_CONFIDENCE = 0.8;
 
-const defaultAgenda: AgendaTopic[] = [
+const demoAgendaDefinition: AgendaDefinition = {
+  id: "demo",
+  title: "Demo agenda",
+  topics: [
+    {
+      id: "welcome",
+      title: "Welcome",
+      prompts: [
+        "Set the tone and confirm the goal for the session.",
+        "Highlight the pace and next steps.",
+      ],
+      minutes: 3,
+    },
+    {
+      id: "wrap-up",
+      title: "Wrap-up",
+      prompts: ["Summarize decisions and confirm action items."],
+      minutes: 2,
+    },
+  ],
+};
+
+const newAgendaTemplate: AgendaTopicInput[] = [
   {
-    id: "intro",
-    title: "Intro and candidate background",
-    minutes: 0.5,
-    done: false,
+    id: "topic-1",
+    title: "Opening",
+    prompts: ["Introduce the agenda and key outcomes."],
+    minutes: 5,
   },
-  { id: "backend", title: "Backend experience", minutes: 0.5, done: false },
   {
-    id: "system",
-    title: "System design discussion",
-    minutes: 0.5,
-    done: false,
+    id: "topic-2",
+    title: "Deep dive",
+    prompts: ["Discuss the main topic in detail."],
+    minutes: 15,
   },
-  { id: "wrap", title: "Wrap-up and questions", minutes: 0.5, done: false },
 ];
 
 const formatTime = (totalSeconds: number) => {
@@ -73,12 +96,19 @@ const formatTime = (totalSeconds: number) => {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 };
 
-const slugify = (value: string) =>
+const mapAgendaTopics = (agenda: AgendaDefinition) =>
+  agenda.topics.map((topic) => ({ ...topic, done: false }));
+
+const toAgendaInputs = (topics: AgendaTopic[]): AgendaTopicInput[] =>
+  topics.map(({ done, ...topic }) => topic);
+
+const toPromptText = (prompts?: string[]) => (prompts ?? []).join("\n");
+
+const parsePromptText = (value: string) =>
   value
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/(^-|-$)/g, "");
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
 
 const buildTranscriptSlice = (entries: TranscriptEntry[]) => {
   if (entries.length === 0) {
@@ -130,6 +160,48 @@ const heuristicClassify = (
   };
 };
 
+type TopicProgress = {
+  remainingSeconds: number;
+  overtimeSeconds: number;
+  started: boolean;
+  totalAllocatedSeconds: number;
+};
+
+const buildInitialTopicProgress = (topics: AgendaTopic[]) =>
+  topics.reduce<Record<string, TopicProgress>>((acc, topic) => {
+    acc[topic.id] = {
+      remainingSeconds: Math.max(0, topic.minutes * 60),
+      overtimeSeconds: 0,
+      started: false,
+      totalAllocatedSeconds: Math.max(0, topic.minutes * 60),
+    };
+    return acc;
+  }, {});
+
+const buildStartTiming = (
+  topic: AgendaTopic,
+  carryOverSeconds: number,
+  progress?: TopicProgress,
+) => {
+  if (progress?.started) {
+    return {
+      allocatedSeconds: progress.remainingSeconds,
+      startingOvertimeSeconds: progress.overtimeSeconds,
+      totalAllocatedSeconds: progress.totalAllocatedSeconds,
+    };
+  }
+
+  const baseSeconds = Math.max(0, topic.minutes * 60);
+  const startingOvertime = Math.max(0, carryOverSeconds - baseSeconds);
+  const allocated = Math.max(0, baseSeconds - carryOverSeconds);
+
+  return {
+    allocatedSeconds: allocated,
+    startingOvertimeSeconds: startingOvertime,
+    totalAllocatedSeconds: baseSeconds,
+  };
+};
+
 const computeTiming = (nowMs: number, timing: TopicTiming | null) => {
   if (!timing) {
     return { remainingSeconds: 0, overtimeSeconds: 0, progress: 0 };
@@ -141,16 +213,37 @@ const computeTiming = (nowMs: number, timing: TopicTiming | null) => {
     timing.startingOvertimeSeconds +
     Math.max(0, elapsed - timing.allocatedSeconds);
   const progress =
-    timing.allocatedSeconds === 0 ? 0 : remaining / timing.allocatedSeconds;
+    timing.totalAllocatedSeconds === 0
+      ? 0
+      : remaining / timing.totalAllocatedSeconds;
 
   return { remainingSeconds: remaining, overtimeSeconds: overtime, progress };
 };
 
 export default function MeetingAssistant() {
-  const [agenda, setAgenda] = useState<AgendaTopic[]>(defaultAgenda);
+  const [agenda, setAgenda] = useState<AgendaTopic[]>(() =>
+    mapAgendaTopics(demoAgendaDefinition),
+  );
+  const [agendaDefinitions, setAgendaDefinitions] = useState<
+    AgendaDefinition[]
+  >([]);
+  const [agendaLoading, setAgendaLoading] = useState(true);
+  const [agendaError, setAgendaError] = useState<string | null>(null);
+  const [selectedAgendaId, setSelectedAgendaId] = useState(
+    demoAgendaDefinition.id,
+  );
+  const [newAgendaTitle, setNewAgendaTitle] = useState("");
+  const [editingTopicId, setEditingTopicId] = useState<string | null>(null);
+  const [editingDraft, setEditingDraft] = useState<AgendaTopicInput | null>(
+    null,
+  );
+  const [editingPrompts, setEditingPrompts] = useState("");
   const [meetingRunning, setMeetingRunning] = useState(false);
   const [currentTopicIndex, setCurrentTopicIndex] = useState(0);
   const [topicTiming, setTopicTiming] = useState<TopicTiming | null>(null);
+  const [topicProgress, setTopicProgress] = useState<
+    Record<string, TopicProgress>
+  >({});
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [transcriptEntries, setTranscriptEntries] = useState<TranscriptEntry[]>(
     [],
@@ -168,6 +261,35 @@ export default function MeetingAssistant() {
     useState<ClassificationSource | null>(null);
   const [audioSource, setAudioSource] = useState<AudioSource>("microphone");
 
+  const availableAgendas = useMemo(() => {
+    const unique = new Map<string, AgendaDefinition>();
+    unique.set(demoAgendaDefinition.id, demoAgendaDefinition);
+    for (const definition of agendaDefinitions) {
+      if (!unique.has(definition.id)) {
+        unique.set(definition.id, definition);
+      }
+    }
+    return Array.from(unique.values());
+  }, [agendaDefinitions]);
+
+  const isCreatingNew = selectedAgendaId === "new";
+
+  const selectedAgendaDefinition = useMemo(() => {
+    return (
+      availableAgendas.find(
+        (definition) => definition.id === selectedAgendaId,
+      ) ?? demoAgendaDefinition
+    );
+  }, [availableAgendas, selectedAgendaId]);
+
+  const isAgendaPersisted = useMemo(
+    () =>
+      agendaDefinitions.some(
+        (definition) => definition.id === selectedAgendaDefinition.id,
+      ),
+    [agendaDefinitions, selectedAgendaDefinition.id],
+  );
+
   const classificationSourceLabel = classificationSource
     ? classificationSource === "browser"
       ? "Browser LLM"
@@ -176,12 +298,40 @@ export default function MeetingAssistant() {
 
   const sessionRef = useRef<TranscriptionSession | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const classifyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transcriptRef = useRef<TranscriptEntry[]>([]);
   const classificationRef = useRef<ClassifiedTopic | null>(null);
   const classificationPendingRef = useRef(false);
   const queuedClassificationRef = useRef<TranscriptEntry[] | null>(null);
   const chimeTopicRef = useRef<string | null>(null);
+
+  const stopTranscription = useCallback(() => {
+    sessionRef.current?.stop();
+    sessionRef.current = null;
+    setPartialTranscript("");
+  }, []);
+
+  useEffect(() => {
+    const loadAgendas = async () => {
+      try {
+        setAgendaLoading(true);
+        setAgendaError(null);
+        const response = await fetch("/api/agendas");
+        if (!response.ok) {
+          throw new Error("Failed to load agendas");
+        }
+        const data = (await response.json()) as { agendas: AgendaDefinition[] };
+        setAgendaDefinitions(data.agendas);
+      } catch (error) {
+        setAgendaError(
+          error instanceof Error ? error.message : "Failed to load agendas",
+        );
+      } finally {
+        setAgendaLoading(false);
+      }
+    };
+
+    void loadAgendas();
+  }, []);
 
   useEffect(() => {
     if (!meetingRunning) {
@@ -196,11 +346,37 @@ export default function MeetingAssistant() {
     () => computeTiming(nowMs, meetingRunning ? topicTiming : null),
     [meetingRunning, nowMs, topicTiming],
   );
+  const progressFillClassName = useMemo(() => {
+    if (timing.remainingSeconds <= 30) {
+      return styles.progressFillAlert;
+    }
+    if (timing.remainingSeconds <= 60) {
+      return styles.progressFillWarning;
+    }
+    return "";
+  }, [timing.remainingSeconds]);
 
   const currentTopic = agenda[currentTopicIndex];
   const doneTopicIds = agenda
     .filter((topic) => topic.done)
     .map((topic) => topic.id);
+
+  useEffect(() => {
+    const nextAgenda = mapAgendaTopics(selectedAgendaDefinition);
+    setAgenda(nextAgenda);
+    setCurrentTopicIndex(0);
+    setTopicTiming(null);
+    setTopicProgress(buildInitialTopicProgress(nextAgenda));
+    setClassification(null);
+    setClassificationError(null);
+    setTranscriptEntries([]);
+    setPartialTranscript("");
+    setEditingTopicId(null);
+    setEditingDraft(null);
+    setEditingPrompts("");
+    setMeetingRunning(false);
+    stopTranscription();
+  }, [selectedAgendaDefinition, stopTranscription]);
 
   useEffect(() => {
     transcriptRef.current = transcriptEntries;
@@ -269,31 +445,198 @@ export default function MeetingAssistant() {
 
   const resetAgenda = useCallback(() => {
     setAgenda((prev) => prev.map((topic) => ({ ...topic, done: false })));
-  }, []);
+    setTopicProgress(buildInitialTopicProgress(agenda));
+  }, [agenda]);
+
+  const persistAgenda = useCallback(
+    async (nextAgenda: AgendaTopic[]) => {
+      const payload = {
+        id: selectedAgendaDefinition.id,
+        title: selectedAgendaDefinition.title,
+        topics: toAgendaInputs(nextAgenda),
+      };
+
+      if (!isAgendaPersisted) {
+        const response = await fetch("/api/agendas", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: selectedAgendaDefinition.title,
+            topics: payload.topics,
+          }),
+        });
+        if (!response.ok) {
+          throw new Error("Failed to save agenda");
+        }
+        const created = (await response.json()) as AgendaDefinition;
+        setAgendaDefinitions((prev) => [created, ...prev]);
+        setSelectedAgendaId(created.id);
+        setAgenda(mapAgendaTopics(created));
+        return;
+      }
+
+      const response = await fetch(`/api/agendas/${payload.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error("Failed to save agenda");
+      }
+      const updated = (await response.json()) as AgendaDefinition;
+      setAgendaDefinitions((prev) =>
+        prev.map((definition) =>
+          definition.id === updated.id ? updated : definition,
+        ),
+      );
+    },
+    [
+      isAgendaPersisted,
+      selectedAgendaDefinition.id,
+      selectedAgendaDefinition.title,
+    ],
+  );
+
+  const handleAgendaSelection = useCallback(
+    (nextId: string) => {
+      if (nextId === selectedAgendaId) {
+        return;
+      }
+      setSelectedAgendaId(nextId);
+    },
+    [selectedAgendaId],
+  );
+
+  const handleCreateAgenda = useCallback(async () => {
+    const title = newAgendaTitle.trim() || "Untitled agenda";
+    const response = await fetch("/api/agendas", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, topics: newAgendaTemplate }),
+    });
+    if (!response.ok) {
+      throw new Error("Failed to create agenda");
+    }
+    const created = (await response.json()) as AgendaDefinition;
+    setAgendaDefinitions((prev) => [created, ...prev]);
+    setSelectedAgendaId(created.id);
+    setAgenda(mapAgendaTopics(created));
+    setNewAgendaTitle("");
+  }, [newAgendaTitle]);
+
+  const handleEditToggle = useCallback(
+    (topic: AgendaTopic) => {
+      if (editingTopicId === topic.id) {
+        setEditingTopicId(null);
+        setEditingDraft(null);
+        setEditingPrompts("");
+        return;
+      }
+
+      setEditingTopicId(topic.id);
+      setEditingDraft({
+        id: topic.id,
+        title: topic.title,
+        minutes: topic.minutes,
+        prompts: topic.prompts,
+      });
+      setEditingPrompts(toPromptText(topic.prompts));
+    },
+    [editingTopicId],
+  );
+
+  const handleEditChange = useCallback(
+    (field: "title" | "minutes", value: string) => {
+      setEditingDraft((prev) => {
+        if (!prev) {
+          return prev;
+        }
+        if (field === "minutes") {
+          return { ...prev, minutes: Number.parseFloat(value) || 0 };
+        }
+        return { ...prev, title: value };
+      });
+    },
+    [],
+  );
+
+  const handleSaveEdit = useCallback(async () => {
+    if (!editingDraft) {
+      return;
+    }
+    const nextTopic = {
+      ...editingDraft,
+      prompts: parsePromptText(editingPrompts),
+    };
+    const nextAgenda = agenda.map((topic) =>
+      topic.id === editingDraft.id ? { ...topic, ...nextTopic } : topic,
+    );
+    setAgenda(nextAgenda);
+    setTopicProgress((prev) => {
+      const current = prev[editingDraft.id];
+      if (!current) {
+        return prev;
+      }
+      const updatedRemaining = Math.max(0, nextTopic.minutes * 60);
+      const remainingSeconds = current.started
+        ? Math.min(current.remainingSeconds, updatedRemaining)
+        : updatedRemaining;
+      return {
+        ...prev,
+        [editingDraft.id]: {
+          ...current,
+          remainingSeconds,
+        },
+      };
+    });
+    setEditingTopicId(null);
+    setEditingDraft(null);
+    setEditingPrompts("");
+    try {
+      await persistAgenda(nextAgenda);
+    } catch (error) {
+      setAgendaError(
+        error instanceof Error ? error.message : "Failed to save agenda",
+      );
+    }
+  }, [agenda, editingDraft, editingPrompts, persistAgenda]);
 
   const startTopic = useCallback(
     (index: number, carryOverSeconds: number) => {
       const topic = agenda[index];
-      const baseSeconds = Math.max(0, topic.minutes * 60);
-      const startingOvertime = Math.max(0, carryOverSeconds - baseSeconds);
-      const allocated = Math.max(0, baseSeconds - carryOverSeconds);
+      const progress = topicProgress[topic.id];
+      const {
+        allocatedSeconds,
+        startingOvertimeSeconds,
+        totalAllocatedSeconds,
+      } = buildStartTiming(topic, carryOverSeconds, progress);
 
       setCurrentTopicIndex(index);
       setTopicTiming({
         startMs: Date.now(),
-        allocatedSeconds: allocated,
-        startingOvertimeSeconds: startingOvertime,
+        allocatedSeconds,
+        startingOvertimeSeconds,
+        totalAllocatedSeconds,
       });
+      setTopicProgress((prev) => ({
+        ...prev,
+        [topic.id]: {
+          remainingSeconds: allocatedSeconds,
+          overtimeSeconds: startingOvertimeSeconds,
+          started: true,
+          totalAllocatedSeconds,
+        },
+      }));
       chimeTopicRef.current = null;
 
       logBrowserEvent("topic_started", {
         topicId: topic.id,
         title: topic.title,
-        allocatedSeconds: allocated,
+        allocatedSeconds,
         carryOverSeconds,
       });
     },
-    [agenda],
+    [agenda, topicProgress],
   );
 
   useEffect(() => {
@@ -319,42 +662,58 @@ export default function MeetingAssistant() {
     topicTiming,
   ]);
 
-  const stopTranscription = useCallback(() => {
-    sessionRef.current?.stop();
-    sessionRef.current = null;
-    setPartialTranscript("");
-  }, []);
-
   const advanceToTopic = useCallback(
-    (index: number) => {
+    (index: number, options?: { markCurrentDone?: boolean }) => {
       if (!meetingRunning || !topicTiming) {
         return;
       }
 
       const now = Date.now();
-      const { overtimeSeconds } = computeTiming(now, topicTiming);
-
-      setAgenda((prev) =>
-        prev.map((topic, idx) => {
-          if (idx < index) {
-            return { ...topic, done: true };
-          }
-          if (idx === currentTopicIndex) {
-            return { ...topic, done: true };
-          }
-          return topic;
-        }),
+      const { remainingSeconds, overtimeSeconds } = computeTiming(
+        now,
+        topicTiming,
       );
+      const markCurrentDone = options?.markCurrentDone ?? false;
 
-      startTopic(index, overtimeSeconds);
+      setTopicProgress((prev) => {
+        const current = currentTopic ? prev[currentTopic.id] : undefined;
+        if (!currentTopic || !current) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [currentTopic.id]: {
+            remainingSeconds,
+            overtimeSeconds,
+            started: true,
+            totalAllocatedSeconds: current.totalAllocatedSeconds,
+          },
+        };
+      });
+
+      if (markCurrentDone) {
+        setAgenda((prev) =>
+          prev.map((topic, idx) => {
+            if (idx < index) {
+              return { ...topic, done: true };
+            }
+            if (idx === currentTopicIndex) {
+              return { ...topic, done: true };
+            }
+            return topic;
+          }),
+        );
+      }
+
+      startTopic(index, markCurrentDone ? overtimeSeconds : 0);
     },
-    [currentTopicIndex, meetingRunning, startTopic, topicTiming],
+    [currentTopic, currentTopicIndex, meetingRunning, startTopic, topicTiming],
   );
 
   const handleNextTopic = useCallback(() => {
     const nextIndex = Math.min(currentTopicIndex + 1, agenda.length - 1);
     if (nextIndex !== currentTopicIndex) {
-      advanceToTopic(nextIndex);
+      advanceToTopic(nextIndex, { markCurrentDone: true });
     }
   }, [advanceToTopic, agenda.length, currentTopicIndex]);
 
@@ -402,7 +761,7 @@ export default function MeetingAssistant() {
           nextIndex !== currentTopicIndex &&
           !agenda[nextIndex].done
         ) {
-          advanceToTopic(nextIndex);
+          advanceToTopic(nextIndex, { markCurrentDone: true });
         }
       } catch (error) {
         setClassificationError(
@@ -496,37 +855,13 @@ export default function MeetingAssistant() {
     });
   }, [stopTranscription]);
 
-  const handleAgendaChange = useCallback(
-    (index: number, field: "title" | "minutes", value: string) => {
-      setAgenda((prev) =>
-        prev.map((topic, idx) => {
-          if (idx !== index) {
-            return topic;
-          }
-
-          if (field === "minutes") {
-            const minutes = Number.parseFloat(value) || 0;
-            return { ...topic, minutes };
-          }
-
-          return { ...topic, title: value, id: slugify(value) || topic.id };
-        }),
+  const handleCreateAgendaClick = useCallback(() => {
+    void handleCreateAgenda().catch((error) => {
+      setAgendaError(
+        error instanceof Error ? error.message : "Failed to create agenda",
       );
-    },
-    [],
-  );
-
-  const handleAddTopic = useCallback(() => {
-    setAgenda((prev) => [
-      ...prev,
-      {
-        id: `topic-${prev.length + 1}`,
-        title: "New topic",
-        minutes: 0.5,
-        done: false,
-      },
-    ]);
-  }, []);
+    });
+  }, [handleCreateAgenda]);
 
   return (
     <section className={styles.container}>
@@ -546,6 +881,63 @@ export default function MeetingAssistant() {
               : ""}
           </span>
         </div>
+
+        <div className={styles.form}>
+          <label className={styles.agendaMeta} htmlFor="agenda-picker">
+            Agenda selection
+          </label>
+          <select
+            id="agenda-picker"
+            className={styles.input}
+            value={selectedAgendaId}
+            onChange={(event) => handleAgendaSelection(event.target.value)}
+            data-testid="agenda-picker"
+          >
+            <option value="demo">Demo agenda</option>
+            {availableAgendas
+              .filter((definition) => definition.id !== "demo")
+              .map((definition) => (
+                <option key={definition.id} value={definition.id}>
+                  {definition.title}
+                </option>
+              ))}
+            <option value="new">+ New agenda</option>
+          </select>
+          {agendaLoading && (
+            <span className={styles.agendaMeta} data-testid="agenda-loading">
+              Loading agendas…
+            </span>
+          )}
+          {agendaError && (
+            <span className={styles.badge} data-testid="agenda-error">
+              {agendaError}
+            </span>
+          )}
+        </div>
+        {isCreatingNew && (
+          <div className={styles.form}>
+            <label className={styles.agendaMeta} htmlFor="new-agenda-title">
+              New agenda name
+            </label>
+            <div className={styles.agendaRow}>
+              <input
+                id="new-agenda-title"
+                className={styles.input}
+                placeholder="Agenda name"
+                value={newAgendaTitle}
+                onChange={(event) => setNewAgendaTitle(event.target.value)}
+              />
+              <button
+                className={`${styles.button} ${styles.buttonSecondary}`}
+                type="button"
+                onClick={handleCreateAgendaClick}
+                disabled={!newAgendaTitle.trim()}
+              >
+                Create
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className={styles.controls}>
           <button
@@ -592,7 +984,7 @@ export default function MeetingAssistant() {
           </div>
           <div className={styles.progressBar}>
             <div
-              className={styles.progressFill}
+              className={`${styles.progressFill} ${progressFillClassName}`}
               style={{
                 width: `${Math.max(0, Math.min(1, timing.progress)) * 100}%`,
               }}
@@ -658,72 +1050,122 @@ export default function MeetingAssistant() {
           Click a topic to force a change. Topic time adjusts after overtime to
           stay on track.
         </p>
-        <div className={styles.agendaList}>
-          {agenda.map((topic, index) => {
-            const isActive = index === currentTopicIndex && meetingRunning;
-            const isDone = topic.done;
-            return (
-              <div
-                key={topic.id}
-                className={`${styles.agendaItem} ${
-                  isActive ? styles.agendaItemActive : ""
-                } ${isDone ? styles.agendaItemDone : ""}`}
-                onClick={() => meetingRunning && advanceToTopic(index)}
-                role="button"
-                tabIndex={0}
-                data-testid={`topic-${topic.id}`}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    meetingRunning && advanceToTopic(index);
+        {!isCreatingNew && (
+          <div className={styles.agendaList}>
+            {agenda.map((topic, index) => {
+              const isActive = index === currentTopicIndex && meetingRunning;
+              const isDone = topic.done;
+              const isEditing = editingTopicId === topic.id;
+              return (
+                <div
+                  key={topic.id}
+                  className={`${styles.agendaItem} ${
+                    isActive ? styles.agendaItemActive : ""
+                  } ${isDone ? styles.agendaItemDone : ""}`}
+                  onClick={() =>
+                    meetingRunning &&
+                    index !== currentTopicIndex &&
+                    advanceToTopic(index)
                   }
-                }}
-              >
-                <div className={styles.agendaRow}>
-                  <span className={styles.agendaTitle}>{topic.title}</span>
-                  <span className={styles.agendaMeta}>{topic.minutes} min</span>
-                </div>
-                {isActive && (
-                  <div className={styles.progressBar}>
-                    <div
-                      className={styles.progressFill}
-                      style={{
-                        width: `${Math.max(0, Math.min(1, timing.progress)) * 100}%`,
-                      }}
-                    />
+                  role="button"
+                  tabIndex={0}
+                  data-testid={`topic-${topic.id}`}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      meetingRunning &&
+                        index !== currentTopicIndex &&
+                        advanceToTopic(index);
+                    }
+                  }}
+                >
+                  <div className={styles.agendaRow}>
+                    <span className={styles.agendaTitle}>{topic.title}</span>
+                    <div className={styles.agendaRow}>
+                      <span className={styles.agendaMeta}>
+                        {topic.minutes} min
+                      </span>
+                      <button
+                        className={styles.buttonGhost}
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleEditToggle(topic);
+                        }}
+                        data-testid={`topic-edit-${topic.id}`}
+                      >
+                        {isEditing ? "Cancel" : "Edit"}
+                      </button>
+                    </div>
                   </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        <div className={styles.form}>
-          <h3>Edit agenda</h3>
-          {agenda.map((topic, index) => (
-            <div className={styles.agendaRow} key={`${topic.id}-edit`}>
-              <input
-                className={styles.input}
-                value={topic.title}
-                onChange={(event) =>
-                  handleAgendaChange(index, "title", event.target.value)
-                }
-              />
-              <input
-                className={styles.input}
-                type="number"
-                min="0"
-                step="0.25"
-                value={topic.minutes}
-                onChange={(event) =>
-                  handleAgendaChange(index, "minutes", event.target.value)
-                }
-              />
-            </div>
-          ))}
-          <button className={styles.buttonGhost} onClick={handleAddTopic}>
-            Add topic
-          </button>
-        </div>
+                  {isEditing ? (
+                    <div
+                      className={styles.form}
+                      data-testid="topic-editor"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <input
+                        className={styles.input}
+                        value={editingDraft?.title ?? ""}
+                        onChange={(event) =>
+                          handleEditChange("title", event.target.value)
+                        }
+                      />
+                      <input
+                        className={styles.input}
+                        type="number"
+                        min="0"
+                        step="0.25"
+                        value={editingDraft?.minutes ?? 0}
+                        onChange={(event) =>
+                          handleEditChange("minutes", event.target.value)
+                        }
+                      />
+                      <textarea
+                        className={styles.textarea}
+                        value={editingPrompts}
+                        onChange={(event) =>
+                          setEditingPrompts(event.target.value)
+                        }
+                      />
+                      <button
+                        className={styles.button}
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleSaveEdit();
+                        }}
+                        data-testid={`topic-save-${topic.id}`}
+                      >
+                        ✓ Save
+                      </button>
+                    </div>
+                  ) : (
+                    topic.prompts &&
+                    topic.prompts.length > 0 && (
+                      <ul className={styles.agendaPrompts}>
+                        {topic.prompts.map((prompt) => (
+                          <li key={prompt} className={styles.agendaPromptItem}>
+                            {prompt}
+                          </li>
+                        ))}
+                      </ul>
+                    )
+                  )}
+                  {isActive && (
+                    <div className={styles.progressBar}>
+                      <div
+                        className={`${styles.progressFill} ${progressFillClassName}`}
+                        style={{
+                          width: `${Math.max(0, Math.min(1, timing.progress)) * 100}%`,
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         <h3>Live transcript</h3>
         <div className={styles.transcript} data-testid="transcript-pane">

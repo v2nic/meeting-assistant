@@ -15,11 +15,12 @@ structured meetings such as interviews or standups where staying on schedule mat
 ## Features
 
 - Live transcription via Vosk Browser with microphone or demo audio input.
-- Agenda editor with topic durations, progress bars, and manual topic overrides.
+- Agenda management with per-topic editing, durations, and progress bars.
 - Overtime tracking that rolls into the next topic to keep the schedule on track.
 - Topic classification using a structured JSON response with agenda context and completed
   topics context.
 - Verification page that plays demo audio to validate Vosk transcription.
+- Persistent agenda storage via JSON files in a git-ignored `agendas/` folder.
 
 ## Setup
 
@@ -35,6 +36,15 @@ npm run dev
 
 The main experience runs at `http://localhost:3000`. The verification page is available
 at `http://localhost:3000/verify`.
+
+## Agenda Management
+
+The app supports creating, editing, and switching between multiple agendas:
+
+- **Select agendas**: Use the dropdown to switch between available agendas. The app defaults to a simple Demo agenda.
+- **Create agendas**: Choose "New agenda" from the dropdown, enter a title, and click Create to generate a new agenda with default topics.
+- **Edit topics**: Click the Edit button on any topic to modify its title, duration, and prompts. Click ✓ Save to persist changes to the agenda file.
+- **Persistence**: All agendas are stored as JSON files in the `agendas/` directory (git-ignored by default). You can manually add agenda files there for pre-defined templates.
 
 ## Demo audio
 
@@ -70,9 +80,12 @@ Development:
 - `src/lib/llm.ts`: browser-first topic classification with API fallback.
 - `src/app/api/classify/route.ts`: server-side classification endpoint using Ollama via
   the AI SDK with a heuristic fallback.
+- `src/app/api/agendas/route.ts`: agenda listing and creation endpoint.
+- `src/app/api/agendas/[id]/route.ts`: agenda update endpoint.
 - `src/app/verify/page.tsx`: verification page that plays demo audio for transcription
   validation.
 - `public/audio/interview.wav`: demo audio asset generated locally.
+- `agendas/`: git-ignored directory containing agenda JSON files.
 
 ## Classification
 
@@ -88,6 +101,5 @@ Run Playwright tests:
 npm run test
 ```
 
-The end-to-end test uses the demo audio source to exercise transcription and topic
-classification. Ensure `npm run generate-audio` has been run at least once so the
-`public/audio/interview.wav` fixture exists.
+The end-to-end test covers agenda management without starting a meeting, including topic editing and agenda creation. Ensure `npm run generate-audio` has been run at least once so the
+`public/audio/interview.wav` fixture exists for demo audio testing.
